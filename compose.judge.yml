@@ -1,0 +1,18 @@
+services:
+  judge:
+    build:
+      context: .
+      dockerfile: Dockerfile.judge
+    ports:
+      - "127.0.0.1:3001:3001"
+    env_file:
+      - .env.local
+    environment:
+      JUDGE_CXX: /usr/bin/g++
+      SERVER_HOST: 0.0.0.0
+    mem_limit: 1g
+    cpus: 2
+    pids_limit: 128
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped

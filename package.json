@@ -1,0 +1,22 @@
+{
+  "name": "algo-arena-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node dev.mjs",
+    "dev:vite": "vite --host 0.0.0.0",
+    "dev:api": "node server.mjs",
+    "build": "vite build",
+    "preview": "vite preview --host 0.0.0.0"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "latest",
+    "lucide-react": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "react-router-dom": "^6.30.1",
+    "vite": "latest"
+  },
+  "devDependencies": {}
+}

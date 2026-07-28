@@ -1,0 +1,11 @@
+node_modules
+dist
+.vite
+.data
+tools/downloads
+tools/w64devkit
+*.local
+*.log
+.env
+.env.*
+!.env.example
