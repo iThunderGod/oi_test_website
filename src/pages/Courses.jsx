@@ -1,13 +1,18 @@
 import { useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { ArrowRight, BookOpen, Check, Clock3, GraduationCap, Play, ShieldCheck, Star, Users } from 'lucide-react'
 import { courses } from '../data/mockData'
 import Modal from '../components/Modal'
 
 export default function Courses() {
+  const [searchParams] = useSearchParams()
+  const searchQuery = searchParams.get('query') || ''
   const [activeCategory, setActiveCategory] = useState('全部课程')
   const [selectedCourse, setSelectedCourse] = useState(null)
   const categories = ['全部课程', '基础算法', '动态规划', '数据结构', '图论', '数学', '字符串']
-  const filtered = activeCategory === '全部课程' ? courses : courses.filter((course) => course.category === activeCategory)
+  const filtered = (searchQuery.trim()
+    ? courses.filter((course) => `${course.title} ${course.category} ${course.description}`.toLocaleLowerCase('zh-CN').includes(searchQuery.trim().toLocaleLowerCase('zh-CN')))
+    : courses).filter((course) => activeCategory === '全部课程' || course.category === activeCategory)
 
   return (
     <div className="page courses-page">
@@ -28,6 +33,7 @@ export default function Courses() {
       </section>
 
       <div className="course-filter-row">
+        {searchQuery && <div className="course-search-context">正在查看与“{searchQuery}”相关的课程</div>}
         <div className="course-categories">
           {categories.map((category) => <button className={activeCategory === category ? 'active' : ''} onClick={() => setActiveCategory(category)} key={category}>{category}</button>)}
         </div>

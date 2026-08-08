@@ -9,3 +9,5 @@ tools/w64devkit
 .env
 .env.*
 !.env.example
+judge/_write_probe.txt
+tmp_defs*.json

@@ -18,6 +18,9 @@ import {
   XCircle,
 } from 'lucide-react'
 import { difficultyClass, findProblem, problems as fallbackProblems } from '../data/problemCatalog'
+import AlgorithmTags from '../components/AlgorithmTags'
+import EditorialPanel from '../components/EditorialPanel'
+import CppEditor from '../components/CppEditor'
 
 const starterCode = `#include <bits/stdc++.h>
 using namespace std;
@@ -48,7 +51,8 @@ function verdictLabel(verdict) {
 
 function statusIcon(status) {
   if (status === 'AC') return <CheckCircle2 size={18} />
-  if (status === 'CE' || status === 'WA' || status === 'RE' || status === 'TLE') return <XCircle size={18} />
+  if (status === 'CE') return <AlertTriangle size={18} />
+  if (status === 'WA' || status === 'RE' || status === 'TLE') return <XCircle size={18} />
   return <AlertTriangle size={18} />
 }
 
@@ -107,7 +111,14 @@ export default function ProblemDetail() {
     fetch(`/api/judge/submissions?problemId=${encodeURIComponent(id)}`)
       .then((response) => response.json())
       .then((data) => {
-        if (canUpdate()) setSubmissions(Array.isArray(data.submissions) ? data.submissions : [])
+        if (canUpdate()) {
+          const history = Array.isArray(data.submissions) ? data.submissions : []
+          setSubmissions(history)
+          if (history[0]) {
+            setResult((current) => current || history[0])
+            if (history[0].code) setCode(history[0].code)
+          }
+        }
       })
       .catch(() => {
         if (canUpdate()) setSubmissions([])
@@ -164,7 +175,7 @@ export default function ProblemDetail() {
       <div className="workspace">
         <section className="statement-pane">
           <div className="pane-tabs">
-            {['题目描述', '提交记录', '讨论'].map((item) => (
+            {['题目描述', '题解', '提交记录', '讨论'].map((item) => (
               <button key={item} className={tab === item ? 'active' : ''} onClick={() => setTab(item)}>{item}</button>
             ))}
           </div>
@@ -177,7 +188,7 @@ export default function ProblemDetail() {
                 <span><FileText size={14} /> {problem.type}</span>
               </div>
               <h2>{problem.title}</h2>
-              <div className="tag-line">{problem.tags.map((tag) => <span key={tag}>{tag}</span>)}</div>
+              <div className="detail-algorithm-tags"><AlgorithmTags tags={problem.tags} /></div>
               <h3>题目描述</h3>
               {problem.statement.description.map((paragraph) => <p key={paragraph}>{paragraph}</p>)}
               <div className="statement-callout"><Sparkles size={17} /><p><strong>思考</strong> {problem.statement.hint}</p></div>
@@ -198,21 +209,25 @@ export default function ProblemDetail() {
                   </div>
                 ))}
               </div>
+              {problem.statement.sampleExplanation && <div className="sample-explanation"><strong>样例说明</strong><p>{problem.statement.sampleExplanation}</p></div>}
+              {problem.statement.solutionOutline && (
+                <div className="solution-outline">
+                  <strong>建模提示与目标复杂度</strong>
+                  <p>{problem.statement.solutionOutline}</p>
+                  <code>{problem.statement.targetComplexity}</code>
+                </div>
+              )}
               <div className="local-warning">
                 <AlertTriangle size={16} />
                 <span>本地评测会直接运行 C++ 程序，只适合个人开发测试；不要提交不可信代码。</span>
               </div>
             </article>
+          ) : tab === '题解' ? (
+            <EditorialPanel problemId={problem.id} active={tab === '题解'} />
           ) : tab === '提交记录' ? (
             <div className="submission-history">
               <div className="history-head"><strong>本题提交记录</strong><span>{submissions.length} 条</span></div>
-              {submissions.map((submission) => (
-                <article className="submission-item" key={submission.id}>
-                  <div><strong className={`verdict ${submission.verdict}`}>{verdictLabel(submission.verdict)}</strong><span>{submission.id}</span></div>
-                  <div><span>{submission.score}/{submission.totalScore} 分</span><span>{submission.passed}/{submission.total} 测试点</span><span>{submission.timeMs || 0} ms</span><span>{formatDate(submission.createdAt)}</span></div>
-                  {submission.compileOutput && <pre>{submission.compileOutput}</pre>}
-                </article>
-              ))}
+              {submissions.map((submission) => <SubmissionHistoryItem key={submission.id} submission={submission} onUseCode={setCode} />)}
               {!submissions.length && <div className="tab-placeholder"><FileText size={32} /><h3>暂无提交记录</h3><p>提交一次完整评测后，会在这里显示每次得分和测试点状态。</p></div>}
             </div>
           ) : (
@@ -230,10 +245,7 @@ export default function ProblemDetail() {
             <button onClick={() => setCode(starterCode)} aria-label="重置代码"><RotateCcw size={15} /></button>
             <button aria-label="全屏"><Maximize2 size={15} /></button>
           </div>
-          <div className="code-editor-wrap">
-            <div className="line-numbers">{Array.from({ length: lineCount }, (_, index) => <span key={index}>{index + 1}</span>)}</div>
-            <textarea spellCheck="false" value={code} onChange={(event) => setCode(event.target.value)} aria-label="代码编辑器" />
-          </div>
+          <div className="code-editor-wrap"><CppEditor value={code} onChange={setCode} lineCount={lineCount} ariaLabel="C++17 代码编辑器" /></div>
           <div className="console-panel">
             <div className="console-tabs">
               <button className={consoleTab === '测试结果' ? 'active' : ''} onClick={() => setConsoleTab('测试结果')}>测试结果</button>
@@ -284,5 +296,18 @@ export default function ProblemDetail() {
         </section>
       </div>
     </div>
+  )
+}
+
+function SubmissionHistoryItem({ submission, onUseCode }) {
+  const [expanded, setExpanded] = useState(false)
+  return (
+    <article className={`submission-item ${expanded ? 'expanded' : ''}`}>
+      <button type="button" className="submission-summary" onClick={() => setExpanded((value) => !value)}>
+        <span><strong className={`verdict ${submission.verdict}`}>{verdictLabel(submission.verdict)}</strong><span>{submission.id}</span></span>
+        <span><span>{submission.score ?? '—'}/{submission.totalScore ?? '—'} 分</span><span>{submission.passed ?? '—'}/{submission.total ?? '—'} 测试点</span><span>{submission.timeMs || 0} ms</span><span>{formatDate(submission.createdAt)}</span></span>
+      </button>
+      {expanded && <div className="submission-details"><div className="submission-detail-actions"><strong>提交代码</strong><button type="button" onClick={() => onUseCode(submission.code || '')} disabled={!submission.code}>替换当前编辑器代码</button></div>{submission.code ? <pre className="submission-code"><code>{submission.code}</code></pre> : <p>该历史记录没有保存代码。</p>}{submission.compileOutput && <><strong>编译输出</strong><pre>{submission.compileOutput}</pre></>}{submission.cases?.length > 0 && <div className="submission-cases">{submission.cases.map((item, index) => <span key={`${item.name}-${index}`}>{item.name}: {item.status}</span>)}</div>}</div>}
+    </article>
   )
 }

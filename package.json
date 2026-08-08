@@ -5,9 +5,13 @@
   "type": "module",
   "scripts": {
     "dev": "node dev.mjs",
+    "dev:detached": "node dev.mjs --detached",
     "dev:vite": "vite --host 0.0.0.0",
     "dev:api": "node server.mjs",
-    "build": "vite build",
+    "validate:codeforces": "node scripts/validate-codeforces-tests.mjs",
+    "generate:codeforces-tests": "node scripts/generate-codeforces-test-packs.mjs --all",
+    "validate:codeforces-interactive": "node scripts/validate-codeforces-interactive-packs.mjs",
+    "build": "npm run validate:codeforces && vite build",
     "preview": "vite preview --host 0.0.0.0"
   },
   "dependencies": {

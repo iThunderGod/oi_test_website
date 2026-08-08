@@ -1,6 +1,9 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { Check, ChevronRight, Circle, Filter, Search, SlidersHorizontal } from 'lucide-react'
+import { useSearchParams } from 'react-router-dom'
+import { ChevronRight, Filter, Search, SlidersHorizontal } from 'lucide-react'
+import AlgorithmTags from '../components/AlgorithmTags'
+import ProblemStatusIcon from '../components/ProblemStatusIcon'
 import {
   categories as fallbackCategories,
   difficultyClass,
@@ -8,10 +11,14 @@ import {
   problems as fallbackProblems,
 } from '../data/problemCatalog'
 
-export default function Problems() {
+export default function Problems({ contestId }) {
+  const [searchParams] = useSearchParams()
+  const isAcmRegional = contestId === 'ACM-R2026-01'
   const [activeCategory, setActiveCategory] = useState('全部题目')
-  const [query, setQuery] = useState('')
+  const [query, setQuery] = useState(() => searchParams.get('query') || '')
   const [difficulty, setDifficulty] = useState('全部难度')
+  const [page, setPage] = useState(1)
+  const pageSize = 25
   const [catalog, setCatalog] = useState({
     categories: fallbackCategories,
     difficulties: fallbackDifficulties,
@@ -48,13 +55,39 @@ export default function Problems() {
     }
   }, [])
 
+  useEffect(() => {
+    const nextQuery = searchParams.get('query') || ''
+    setQuery(nextQuery)
+    setPage(1)
+  }, [searchParams])
+
   const filtered = useMemo(() => catalog.problems.filter((problem) => {
     const searchText = `${problem.id}${problem.title}${problem.series}${problem.tags.join('')}`.toLowerCase()
     const matchesQuery = searchText.includes(query.trim().toLowerCase())
     const matchesCategory = activeCategory === '全部题目' || problem.series === activeCategory || problem.tags.includes(activeCategory)
     const matchesDifficulty = difficulty === '全部难度' || problem.difficulty === difficulty
-    return matchesQuery && matchesCategory && matchesDifficulty
-  }), [activeCategory, catalog.problems, difficulty, query])
+    const matchesContest = !isAcmRegional || problem.series === 'ACM 模拟竞赛'
+    return matchesQuery && matchesCategory && matchesDifficulty && matchesContest
+  }), [activeCategory, catalog.problems, difficulty, isAcmRegional, query])
+
+  const pageCount = Math.max(1, Math.ceil(filtered.length / pageSize))
+  const currentPage = Math.min(page, pageCount)
+  const visibleProblems = filtered.slice((currentPage - 1) * pageSize, currentPage * pageSize)
+
+  const updateCategory = (value) => {
+    setActiveCategory(value)
+    setPage(1)
+  }
+
+  const updateDifficulty = (value) => {
+    setDifficulty(value)
+    setPage(1)
+  }
+
+  const updateQuery = (value) => {
+    setQuery(value)
+    setPage(1)
+  }
 
   const judgedCount = catalog.problems.filter((problem) => problem.testPointCount || problem.sampleCount).length
 
@@ -62,41 +95,41 @@ export default function Problems() {
     <div className="page problems-page">
       <section className="problem-banner">
         <div>
-          <span className="eyebrow dark"><span className="live-dot" /> 训练题库</span>
-          <h2>按算法系列推进，<br />每题都能提交评测。</h2>
-          <p>题库按语言基础、搜索、动态规划、图论等系列组织，难度参考竞赛训练分层并做了本项目自己的调整。</p>
+          <span className="eyebrow dark"><span className="live-dot" /> {isAcmRegional ? 'ACM 模拟竞赛' : '训练题库'}</span>
+          <h2>{isAcmRegional ? <>北陆区域赛模拟 2026<br />A–J，按真实赛场节奏推进。</> : <>按算法系列推进，<br />每题都能提交评测。</>}</h2>
+          <p>{isAcmRegional ? '本套题包含签到、推进题与压轴题。题目按 A–J 编排，适合限时模拟和赛后补题。' : '题库按语言基础、搜索、动态规划、图论等系列组织，难度参考竞赛训练分层并做了本项目自己的调整。'}</p>
         </div>
         <div className="banner-metrics">
-          <div><strong>{catalog.problems.length}</strong><span>原创题目</span></div>
-          <div><strong>{catalog.categories.length}</strong><span>算法系列</span></div>
+          <div><strong>{isAcmRegional ? filtered.length : catalog.problems.length}</strong><span>{isAcmRegional ? '本场赛题' : '原创题目'}</span></div>
+          <div><strong>{isAcmRegional ? 'A–J' : catalog.categories.length}</strong><span>{isAcmRegional ? '竞赛题号' : '算法系列'}</span></div>
           <div><strong>{judgedCount}</strong><span>可评测题</span></div>
         </div>
       </section>
 
       {error && <div className="notice-bar">{error}</div>}
 
-      <section className="category-strip">
-        <button className={activeCategory === '全部题目' ? 'active' : ''} onClick={() => setActiveCategory('全部题目')}>
+      {!isAcmRegional && <section className="category-strip">
+        <button className={activeCategory === '全部题目' ? 'active' : ''} onClick={() => updateCategory('全部题目')}>
           <span className="category-number">ALL</span><strong>全部题目</strong><small>{catalog.problems.length}</small>
         </button>
         {catalog.categories.map((category) => (
-          <button key={category.name} className={activeCategory === category.name ? 'active' : ''} onClick={() => setActiveCategory(category.name)}>
+          <button key={category.name} className={activeCategory === category.name ? 'active' : ''} onClick={() => updateCategory(category.name)}>
             <span className="category-number">{category.icon}</span><strong>{category.name}</strong><small>{category.count}</small>
           </button>
         ))}
-      </section>
+      </section>}
 
       <section className="content-card problem-table-card">
         <div className="table-tools">
-          <label className="table-search"><Search size={17} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索题号、标题或标签..." /></label>
+          <label className="table-search"><Search size={17} /><input value={query} onChange={(event) => updateQuery(event.target.value)} placeholder="搜索题号、标题或标签..." /></label>
           <div className="tool-select">
             <Filter size={15} />
-            <select value={difficulty} onChange={(event) => setDifficulty(event.target.value)}>
+            <select value={difficulty} onChange={(event) => updateDifficulty(event.target.value)}>
               <option>全部难度</option>
               {catalog.difficulties.map((item) => <option key={item.name}>{item.name}</option>)}
             </select>
           </div>
-          <span className="filter-button static"><SlidersHorizontal size={16} /> 按题号排序</span>
+          <span className="filter-button static"><SlidersHorizontal size={16} /> {isAcmRegional ? '按赛题编号排序' : '按题号排序'}</span>
           <span className="result-count">{loading ? '正在加载题库...' : `共 ${filtered.length} 道题`}</span>
         </div>
 
@@ -104,15 +137,13 @@ export default function Problems() {
           <div className="problem-row table-head">
             <span>状态</span><span>题目</span><span>系列</span><span>难度</span><span>通过率</span><span>提交数</span><span />
           </div>
-          {filtered.map((problem) => (
+          {visibleProblems.map((problem) => (
             <Link to={`/problems/${problem.id}`} className="problem-row" key={problem.id}>
-              <span className={`status-mark ${problem.status === '通过' ? 'accepted' : problem.status ? 'tried' : ''}`}>
-                {problem.status === '通过' ? <Check size={14} /> : <Circle size={13} />}
-              </span>
+              <ProblemStatusIcon verdict={problem.status} />
               <span className="table-problem-title">
                 <small>{problem.id}</small>
                 <strong>{problem.title}</strong>
-                <em>{problem.tags.slice(0, 3).map((tag) => <i key={tag}>{tag}</i>)}</em>
+                <AlgorithmTags tags={problem.tags} compact stopNavigation />
               </span>
               <span className="series-cell">{problem.series}</span>
               <span><i className={`difficulty-label ${difficultyClass(problem.difficulty)}`}>{problem.difficulty}</i></span>
@@ -123,6 +154,13 @@ export default function Problems() {
           ))}
           {!filtered.length && <div className="empty-state"><Search size={28} /><strong>没有找到匹配的题目</strong><p>换个关键词或筛选条件试试。</p></div>}
         </div>
+        {filtered.length > pageSize && (
+          <nav className="problem-pagination" aria-label="题库分页">
+            <button disabled={currentPage <= 1} onClick={() => setPage(currentPage - 1)}>上一页</button>
+            <span>第 {currentPage} / {pageCount} 页</span>
+            <button disabled={currentPage >= pageCount} onClick={() => setPage(currentPage + 1)}>下一页</button>
+          </nav>
+        )}
       </section>
     </div>
   )

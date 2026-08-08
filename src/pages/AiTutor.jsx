@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import {
   ArrowDown,
   ArrowUp,
@@ -139,6 +140,9 @@ function persistableConversations(conversations) {
 }
 
 export default function AiTutor() {
+  const [searchParams] = useSearchParams()
+  const promptFromSearch = searchParams.get('prompt') || ''
+  const autoPromptSent = useRef(false)
   const [history, setHistory] = useState(readConversations)
   const [activeConversationId, setActiveConversationId] = useState(null)
   const [messages, setMessages] = useState([])
@@ -169,6 +173,13 @@ export default function AiTutor() {
   }, [])
 
   useEffect(() => () => abortRef.current?.abort(), [])
+
+  useEffect(() => {
+    if (!promptFromSearch.trim() || autoPromptSent.current) return
+    autoPromptSent.current = true
+    const timer = setTimeout(() => sendMessage(promptFromSearch), 0)
+    return () => clearTimeout(timer)
+  }, [promptFromSearch])
 
   const updateConversation = (conversationId, updater) => {
     setHistory((items) => items.map((item) => item.id === conversationId ? updater(item) : item))

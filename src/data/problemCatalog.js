@@ -1,3 +1,20 @@
+import { dpPracticeProblems } from '../../judge/dpPracticeBank.mjs'
+import { algorithmRoundProblems, getAlgorithmRoundSample } from '../../judge/algorithmRoundBank.mjs'
+import { algorithmBatch3Problems, getAlgorithmBatch3Sample } from '../../judge/algorithmBatch3Bank.mjs'
+import { algorithmBatch4Problems, getAlgorithmBatch4Sample } from '../../judge/algorithmBatch4Bank.mjs'
+import { algorithmBatch5Problems, getAlgorithmBatch5Sample } from '../../judge/algorithmBatch5Bank.mjs'
+import { algorithmBatch6Problems, getAlgorithmBatch6Sample } from '../../judge/algorithmBatch6Bank.mjs'
+import { algorithmBatch7Problems, getAlgorithmBatch7Sample } from '../../judge/algorithmBatch7Bank.mjs'
+import { algorithmBatch8Problems, getAlgorithmBatch8Sample } from '../../judge/algorithmBatch8Bank.mjs'
+import { algorithmBatch9Problems, getAlgorithmBatch9Sample } from '../../judge/algorithmBatch9Bank.mjs'
+import { algorithmBatch10Problems, getAlgorithmBatch10Sample } from '../../judge/algorithmBatch10Bank.mjs'
+import { algorithmBatch11Problems, getAlgorithmBatch11Sample } from '../../judge/algorithmBatch11Bank.mjs'
+import { algorithmBatch12Problems, getAlgorithmBatch12Sample } from '../../judge/algorithmBatch12Bank.mjs'
+import { algorithmBatch13Problems, getAlgorithmBatch13Sample } from '../../judge/algorithmBatch13Bank.mjs'
+import { algorithmBatch14Problems, getAlgorithmBatch14Sample } from '../../judge/algorithmBatch14Bank.mjs'
+import { algorithmBatch15Problems, getAlgorithmBatch15Sample } from '../../judge/algorithmBatch15Bank.mjs'
+import { acmRegional2026Problems, getAcmRegional2026Sample } from '../../judge/acmRegional2026Bank.mjs'
+
 export const difficultyLevels = [
   { name: '入门', rank: 1 },
   { name: '基础', rank: 2 },
@@ -669,9 +686,10 @@ const rawProblems = [
 
 const difficultyRankMap = Object.fromEntries(difficultyLevels.map((item) => [item.name, item.rank]))
 
-export const problems = rawProblems
+export const problems = [...rawProblems, ...dpPracticeProblems, ...algorithmRoundProblems, ...algorithmBatch3Problems, ...algorithmBatch4Problems, ...algorithmBatch5Problems, ...algorithmBatch6Problems, ...algorithmBatch7Problems, ...algorithmBatch8Problems, ...algorithmBatch9Problems, ...algorithmBatch10Problems, ...algorithmBatch11Problems, ...algorithmBatch12Problems, ...algorithmBatch13Problems, ...algorithmBatch14Problems, ...algorithmBatch15Problems, ...acmRegional2026Problems]
   .map((problem) => ({
     ...problem,
+    samples: problem.samples?.[0]?.output === '' ? [getAlgorithmRoundSample(problem.id) || getAlgorithmBatch3Sample(problem.id) || getAlgorithmBatch4Sample(problem.id) || getAlgorithmBatch5Sample(problem.id) || getAlgorithmBatch6Sample(problem.id) || getAlgorithmBatch7Sample(problem.id) || getAlgorithmBatch10Sample(problem.id) || getAlgorithmBatch11Sample(problem.id) || getAlgorithmBatch12Sample(problem.id) || getAlgorithmBatch13Sample(problem.id) || getAlgorithmBatch14Sample(problem.id) || getAlgorithmBatch15Sample(problem.id) || getAcmRegional2026Sample(problem.id)] : problem.samples,
     difficultyRank: difficultyRankMap[problem.difficulty] || 99,
     sampleCount: problem.samples.length,
   }))

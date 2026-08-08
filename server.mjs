@@ -7,11 +7,25 @@ import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { categories, difficultyLevels, problems } from './src/data/problemCatalog.js'
-import { getProblemTests } from './judge/problemTests.mjs'
+import { checkProblemTestOutput, getCodeforcesTestPackStatus, getProblemTests } from './judge/problemTests.mjs'
+import { readGeneratedCodeforcesPack } from './judge/codeforcesPackStore.mjs'
+import { runCodeforcesInteractiveTest } from './judge/codeforcesInteractive.mjs'
+import {
+  getCodeforcesContest,
+  getCodeforcesProblem,
+  getCodeforcesStatus,
+  listCodeforcesContests,
+  syncCodeforcesContests,
+  getSeededProblem,
+  getCachedCodeforcesTranslation,
+  saveCodeforcesTranslation,
+  pretranslateCodeforcesStatements,
+} from './codeforcesService.mjs'
 
 const projectRoot = fileURLToPath(new URL('.', import.meta.url))
 const dataDir = resolve(projectRoot, '.data')
 const submissionsPath = resolve(dataDir, 'submissions.json')
+const editorialsPath = resolve(dataDir, 'editorials.json')
 const bundledGppPath = resolve(projectRoot, 'tools', 'w64devkit', 'bin', 'g++.exe')
 
 const MAX_CHAT_BYTES = 8 * 1024 * 1024
@@ -39,9 +53,32 @@ loadEnvFile('.env.local')
 
 const port = Number(process.env.AI_API_PORT || 3001)
 const host = process.env.SERVER_HOST || '127.0.0.1'
-const apiBaseUrl = (process.env.AI_API_BASE_URL || 'https://aigw.sotatts.online/v1').replace(/\/$/, '')
+const apiBaseUrl = (process.env.AI_API_BASE_URL || 'https://api.openai.com/v1').replace(/\/$/, '')
 const apiKey = process.env.AI_API_KEY || ''
 const model = process.env.AI_MODEL || 'gpt-5.5'
+let codeforcesTestGenerationProcess = null
+
+function scheduleCodeforcesTestPackGeneration() {
+  if (codeforcesTestGenerationProcess && codeforcesTestGenerationProcess.exitCode === null) return false
+  const generatorPath = resolve(projectRoot, 'scripts', 'generate-codeforces-test-packs.mjs')
+  codeforcesTestGenerationProcess = spawn(process.execPath, [generatorPath, '--all', '--concurrency=1'], {
+    cwd: projectRoot,
+    windowsHide: true,
+    stdio: 'ignore',
+    env: { ...process.env, AI_TEST_MODEL: process.env.AI_TEST_MODEL || 'gpt-5.4' },
+  })
+  codeforcesTestGenerationProcess.unref?.()
+  codeforcesTestGenerationProcess.once('exit', () => { codeforcesTestGenerationProcess = null })
+  return true
+}
+
+// Server-side course index used by the global search resolver.
+const courseIndex = [
+  { id: 'dp-foundation', title: '动态规划：从状态设计到模型优化', category: '动态规划', description: '建立完整的动态规划思维框架，掌握背包、区间、树形与状态压缩 DP。' },
+  { id: 'graph-advanced', title: '图论进阶：网络流与匹配专题', category: '图论', description: '从增广路出发，系统掌握最大流、最小割、费用流与二分图匹配。' },
+  { id: 'data-structure', title: '高级数据结构精讲与实战', category: '数据结构', description: '线段树、树状数组、平衡树与可持久化结构。' },
+  { id: 'search-thinking', title: '搜索与剪枝：解题思维训练', category: '搜索', description: '通过经典模型掌握 DFS、BFS、双向搜索、A* 与高效剪枝。' },
+]
 
 function sendJson(response, statusCode, payload) {
   const body = JSON.stringify(payload)
@@ -168,6 +205,47 @@ async function streamChat(request, response) {
   } finally {
     if (!response.destroyed) response.end()
   }
+}
+
+async function handleCodeforcesTranslate(request, response) {
+  let body
+  try { body = await readJson(request, MAX_CHAT_BYTES) } catch (error) { sendJson(response, 400, { error: { message: error.message } }); return }
+  const problem = await findAnyProblem(body.problemId)
+  if (!problem) { sendJson(response, 404, { error: { message: 'Problem not found' } }); return }
+  const cached = getCachedCodeforcesTranslation(problem.id, problem.statement)
+  if (cached) {
+    sendJson(response, 200, { translation: cached, cached: true })
+    return
+  }
+  if (!apiKey) {
+    sendJson(response, 503, { error: { message: 'AI_API_KEY is not configured; English statement remains available.' } })
+    return
+  }
+  const source = JSON.stringify(problem.statement)
+  const upstream = await fetch(`${apiBaseUrl}/chat/completions`, {
+    method: 'POST', headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model, temperature: 0.1, messages: [{ role: 'system', content: 'Translate the JSON problem statement into Simplified Chinese. Return valid JSON with the same keys, preserving samples and sourceUrl.' }, { role: 'user', content: source }] }),
+  }).catch((error) => ({ ok: false, status: 502, text: async () => error.message }))
+  if (!upstream.ok) { sendJson(response, upstream.status || 502, { error: { message: (await upstream.text().catch(() => 'Translation failed')).slice(0, 1000) } }); return }
+  const data = await upstream.json()
+  const content = data.choices?.[0]?.message?.content || ''
+  let translation
+  try { translation = JSON.parse(content.replace(/^```json\s*|\s*```$/g, '')) } catch { sendJson(response, 502, { error: { message: 'AI returned an invalid translation format.' } }); return }
+  await saveCodeforcesTranslation(problem.id, problem.statement, translation)
+  sendJson(response, 200, { translation, cached: false })
+}
+
+async function translateCodeforcesProblem(problem) {
+  if (!apiKey || !problem?.statement?.available) return null
+  const source = JSON.stringify(problem.statement)
+  const upstream = await fetch(`${apiBaseUrl}/chat/completions`, {
+    method: 'POST', headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model, temperature: 0.1, messages: [{ role: 'system', content: 'Translate the JSON problem statement into Simplified Chinese. Return valid JSON with the same keys, preserving samples and sourceUrl.' }, { role: 'user', content: source }] }),
+  })
+  if (!upstream.ok) throw new Error(`AI translation HTTP ${upstream.status}`)
+  const data = await upstream.json()
+  const content = data.choices?.[0]?.message?.content || ''
+  try { return JSON.parse(content.replace(/^```json\s*|\s*```$/g, '')) } catch { throw new Error('AI returned an invalid translation format') }
 }
 
 function getExecutableExtensions() {
@@ -380,16 +458,49 @@ function normalizeOutput(value) {
     .trimEnd()
 }
 
-function publicProblem(problem) {
-  const tests = getProblemTests(problem.id)
-  return {
+function publicProblem(problem, { detail = true } = {}) {
+  const tests = getAnyProblemTests(problem)
+  const metadata = {
     ...problem,
     testPointCount: tests.length,
     totalScore: tests.reduce((sum, item) => sum + Number(item.score || 0), 0),
   }
+  if (detail) return metadata
+
+  const { statement, samples, ...summary } = metadata
+  return summary
 }
 
-async function judgeCode({ problem, code, tests, customInput = null }) {
+function latestVerdictsFor(submissions, problemIds = null) {
+  const allowed = problemIds ? new Set(problemIds) : null
+  const latest = new Map()
+  for (const submission of submissions) {
+    if (allowed && !allowed.has(submission.problemId)) continue
+    // A solved problem stays solved even if the user later submits an
+    // experimental wrong answer. Before the first AC, show the latest result.
+    if (latest.get(submission.problemId) !== 'AC') latest.set(submission.problemId, submission.verdict || '')
+  }
+  return Object.fromEntries(latest)
+}
+
+async function findAnyProblem(id) {
+  const local = problems.find((item) => item.id === id)
+  if (local) return local
+  const match = String(id || '').match(/^CF-(\d+)-([A-Za-z][0-9]*)$/i)
+  return match ? (await getCodeforcesProblem(match[1], match[2])) || getSeededProblem(match[1], match[2]) : null
+}
+
+function getAnyProblemTests(problem) {
+  const local = getProblemTests(problem.id)
+  if (local.length) return local
+  // Codeforces samples are suitable for the Run Sample action only. Full
+  // submissions require a policy-compliant local pack instead of silently
+  // treating one or two public samples as the complete judge data.
+  if (String(problem?.id || '').startsWith('CF-')) return []
+  return problem?.statement?.samples?.map((sample, index) => ({ name: `Sample ${index + 1}`, score: 100 / Math.max(1, problem.statement.samples.length), ...sample })) || []
+}
+
+async function judgeCode({ problem, code, tests, customInput = null, expectedOutput = null }) {
   if (typeof code !== 'string' || !code.trim()) {
     return {
       verdict: 'CE',
@@ -480,23 +591,64 @@ async function judgeCode({ problem, code, tests, customInput = null }) {
         maxOutputBytes: MAX_OUTPUT_BYTES,
         env: compiler.env,
       })
-      const status = run.timedOut ? 'TLE' : run.outputTruncated || run.exitCode !== 0 ? 'RE' : 'AC'
+      let status = run.timedOut ? 'TLE' : run.outputTruncated || run.exitCode !== 0 ? 'RE' : expectedOutput === null ? 'RUN' : 'AC'
+      if (status === 'AC' && normalizeOutput(run.stdout) !== normalizeOutput(expectedOutput)) status = 'WA'
       return {
         verdict: status,
-        score: status === 'AC' ? 100 : 0,
+        score: status === 'AC' ? 100 : null,
         totalScore: 100,
-        passed: status === 'AC' ? 1 : 0,
+        passed: status === 'AC' ? 1 : null,
         total: 1,
         compiler: publicCompiler(compiler),
         stdout: run.stdout.slice(0, 20_000),
         stderr: run.stderr.slice(0, 6000),
         cases: [{
-          name: '自定义输入',
-          score: status === 'AC' ? 100 : 0,
+          name: expectedOutput !== null ? '样例' : '自定义输入',
+          score: status === 'AC' ? 100 : null,
           status,
           timeMs: run.durationMs,
-          message: status === 'TLE' ? '运行超时' : status === 'RE' ? '运行错误或输出过大' : '运行完成',
+          message: status === 'TLE' ? '运行超时' : status === 'RE' ? '运行错误或输出过大' : status === 'WA' ? '样例输出不匹配' : status === 'RUN' ? '程序运行完成，未提供标准输出，未判定正误。' : '运行完成',
         }],
+      }
+    }
+
+    const interactivePack = String(problem?.id || '').startsWith('CF-') ? readGeneratedCodeforcesPack(problem.id) : null
+    if (interactivePack?.mode === 'interactive') {
+      let score = 0
+      let passed = 0
+      let worstVerdict = 'AC'
+      const cases = []
+      for (const test of tests) {
+        const run = await runCodeforcesInteractiveTest(binaryFile, test, interactivePack.interactor, {
+          cwd: workDir,
+          env: compiler.env,
+          timeoutMs: Math.max(Number(test.timeoutMs || 0), Number(problem.limitMs || 1000) + 1500, 2500),
+        })
+        const status = run.status === 'JE' ? 'RE' : run.status
+        if (status === 'AC') {
+          score += Number(test.score || 0)
+          passed += 1
+        } else if (worstVerdict === 'AC' || (worstVerdict === 'WA' && status !== 'WA')) {
+          worstVerdict = status
+        }
+        cases.push({
+          name: test.name,
+          score: Number(test.score || 0),
+          status,
+          timeMs: run.durationMs,
+          message: run.status === 'JE' ? `判题器错误：${run.message}` : run.message,
+        })
+      }
+      const totalScore = tests.reduce((sum, test) => sum + Number(test.score || 0), 0)
+      return {
+        verdict: passed === tests.length ? 'AC' : worstVerdict,
+        score,
+        totalScore,
+        passed,
+        total: tests.length,
+        compiler: publicCompiler(compiler),
+        cases,
+        message: passed === tests.length ? '全部交互测试点通过。' : `通过 ${passed}/${tests.length} 个交互测试点。`,
       }
     }
 
@@ -525,9 +677,13 @@ async function judgeCode({ problem, code, tests, customInput = null }) {
       } else if (run.exitCode !== 0) {
         status = 'RE'
         message = run.stderr ? `运行错误：${run.stderr.slice(0, 300)}` : '程序非零退出'
-      } else if (normalizeOutput(run.stdout) !== normalizeOutput(test.output)) {
-        status = 'WA'
-        message = '答案错误'
+      } else {
+        const comparison = checkProblemTestOutput(problem.id, test, run.stdout)
+        if (!comparison.ok) {
+          status = 'WA'
+          message = comparison.message || '答案错误'
+          if (comparison.judgeError) status = 'RE'
+        }
       }
 
       if (status === 'AC') {
@@ -566,7 +722,7 @@ async function readSubmissions() {
   try {
     const text = await readFile(submissionsPath, 'utf8')
     const data = JSON.parse(text)
-    return Array.isArray(data) ? data : []
+    return Array.isArray(data) ? retainRecentSubmissions(data) : []
   } catch {
     return []
   }
@@ -579,24 +735,38 @@ async function writeSubmissions(submissions) {
   await rename(tempPath, submissionsPath)
 }
 
+function retainRecentSubmissions(submissions, perProblem = 15, maxTotal = 500) {
+  const counts = new Map()
+  const kept = []
+  for (let index = submissions.length - 1; index >= 0; index -= 1) {
+    const submission = submissions[index]
+    const count = counts.get(submission.problemId) || 0
+    if (count >= perProblem) continue
+    counts.set(submission.problemId, count + 1)
+    kept.push(submission)
+  }
+  return kept.reverse().slice(-maxTotal)
+}
+
 async function listProblems() {
   const submissions = await readSubmissions()
-  const latestByProblem = new Map()
+  const statusByProblem = latestVerdictsFor(submissions)
   const counts = new Map()
 
   for (const submission of submissions) {
     counts.set(submission.problemId, (counts.get(submission.problemId) || 0) + 1)
   }
-  for (const submission of [...submissions].reverse()) {
-    if (!latestByProblem.has(submission.problemId)) latestByProblem.set(submission.problemId, submission)
-  }
-
   return problems.map((problem) => {
-    const latest = latestByProblem.get(problem.id)
+    const problemSubmissions = submissions.filter((item) => item.problemId === problem.id)
+    const latest = problemSubmissions.at(-1)
+    const status = statusByProblem[problem.id] || ''
     return {
-      ...publicProblem(problem),
+      ...publicProblem(problem, { detail: false }),
       submissions: problem.submissions + (counts.get(problem.id) || 0),
-      status: latest?.verdict === 'AC' ? '通过' : latest ? '尝试过' : problem.status,
+      // Keep the raw verdict so the UI can distinguish accepted, failed and
+      // compile-error submissions. Problems with no submission remain blank.
+      status,
+      latestVerdict: status,
       lastSubmission: latest ? {
         id: latest.id,
         verdict: latest.verdict,
@@ -605,6 +775,315 @@ async function listProblems() {
       } : null,
     }
   })
+}
+
+function normalizeSearchText(value) {
+  return String(value || '')
+    .trim()
+    .toLocaleLowerCase('zh-CN')
+    .replace(/[\s\u3000]+/g, ' ')
+    .replace(/[\p{P}\p{S}]+/gu, '')
+}
+
+function problemSearchText(problem) {
+  const statement = problem?.statement || {}
+  return normalizeSearchText([
+    problem.id,
+    problem.title,
+    problem.series,
+    ...(problem.tags || []),
+    ...(statement.description || []),
+    statement.input,
+    statement.output,
+    statement.hint,
+  ].filter(Boolean).join(' '))
+}
+
+function scoreSearchCandidate(problem, normalizedQuery) {
+  const id = normalizeSearchText(problem.id)
+  const title = normalizeSearchText(problem.title || problem.name)
+  const series = normalizeSearchText(problem.series)
+  const tags = normalizeSearchText((problem.tags || []).join(' '))
+  const full = problemSearchText(problem)
+  let score = 0
+  if (id.includes(normalizedQuery)) score += id === normalizedQuery ? 120 : 90
+  if (title.includes(normalizedQuery)) score += title === normalizedQuery ? 110 : 80
+  if (series.includes(normalizedQuery)) score += 35
+  if (tags.includes(normalizedQuery)) score += 32
+  if (full.includes(normalizedQuery)) score += 10
+  return score
+}
+
+async function askSearchAgent(query) {
+  if (!apiKey) return 'ai'
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), 8_000)
+  try {
+    const upstream = await fetch(`${apiBaseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+      signal: controller.signal,
+      body: JSON.stringify({
+        model,
+        temperature: 0,
+        max_tokens: 80,
+        messages: [
+          { role: 'system', content: '将搜索词分类为 ai 或 course，只返回 JSON：{"kind":"ai"}。题目匹配已经由本地完成。' },
+          { role: 'user', content: query },
+        ],
+      }),
+    })
+    if (!upstream.ok) return 'ai'
+    const data = await upstream.json()
+    const content = String(data.choices?.[0]?.message?.content || '')
+    const parsed = JSON.parse(content.replace(/^```json\s*|\s*```$/g, ''))
+    return parsed.kind === 'course' ? 'course' : 'ai'
+  } catch {
+    return 'ai'
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+async function resolveSearch(query) {
+  const originalQuery = String(query || '').trim()
+  const normalizedQuery = normalizeSearchText(originalQuery)
+  if (!normalizedQuery) return { kind: 'none', query: originalQuery, target: '/', reason: 'empty-query' }
+
+  const localProblems = problems
+  const exactLocal = localProblems.find((problem) => normalizeSearchText(problem.id) === normalizedQuery || normalizeSearchText(problem.title) === normalizedQuery)
+  if (exactLocal) {
+    return { kind: 'problem-detail', query: originalQuery, target: `/problems/${encodeURIComponent(exactLocal.id)}`, problem: publicProblem(exactLocal), reason: 'exact-problem' }
+  }
+
+  // Codeforces ids/titles are searchable too, while keeping their native route.
+  try {
+    const contests = await listCodeforcesContests()
+    for (const contest of contests) {
+      for (const item of contest.problems || []) {
+        const id = `CF-${contest.id}-${item.index}`
+        if (normalizeSearchText(id) === normalizedQuery || normalizeSearchText(item.name) === normalizedQuery) {
+          return { kind: 'problem-detail', query: originalQuery, target: `/codeforces/contests/${contest.id}/problems/${encodeURIComponent(item.index)}`, problem: item, reason: 'exact-codeforces-problem' }
+        }
+      }
+    }
+  } catch {
+    // The local catalog remains usable when Codeforces is unavailable.
+  }
+
+  const related = localProblems
+    .map((problem) => ({ problem, score: scoreSearchCandidate(problem, normalizedQuery) }))
+    .filter((item) => item.score >= 30)
+    .sort((a, b) => b.score - a.score || a.problem.id.localeCompare(b.problem.id))
+    .slice(0, 20)
+    .map(({ problem }) => publicProblem(problem, { detail: false }))
+  if (related.length) {
+    return { kind: 'problem-list', query: originalQuery, target: `/problems?query=${encodeURIComponent(originalQuery)}`, relatedProblems: related, reason: 'related-problems' }
+  }
+
+  const course = courseIndex.find((item) => normalizeSearchText(`${item.title} ${item.category} ${item.description}`).includes(normalizedQuery))
+  if (course) return { kind: 'course', query: originalQuery, target: `/courses?query=${encodeURIComponent(originalQuery)}`, course, reason: 'course-match' }
+
+  await askSearchAgent(originalQuery)
+  return {
+    kind: 'ai',
+    query: originalQuery,
+    target: `/ai?prompt=${encodeURIComponent(originalQuery)}`,
+    aiPrompt: `请用中文详细回答这个算法知识问题，并给出必要的复杂度分析、思路和示例：${originalQuery}`,
+    reason: 'knowledge-point',
+  }
+}
+
+async function buildOverview() {
+  const submissions = await readSubmissions()
+  const catalog = await listProblems()
+  const now = Date.now()
+  const weekStart = now - 7 * 24 * 60 * 60 * 1000
+  const weekSubmissions = submissions.filter((item) => Date.parse(item.createdAt || '') >= weekStart)
+  const acceptedIds = new Set(submissions.filter((item) => item.verdict === 'AC').map((item) => item.problemId))
+  const attemptedIds = new Set(submissions.map((item) => item.problemId))
+  const seriesMap = new Map()
+  for (const problem of catalog) {
+    const current = seriesMap.get(problem.series) || { label: problem.series, total: 0, solved: 0 }
+    current.total += 1
+    if (acceptedIds.has(problem.id)) current.solved += 1
+    seriesMap.set(problem.series, current)
+  }
+  const seriesProgress = [...seriesMap.values()].map((item) => ({ ...item, percent: item.total ? Math.round(item.solved / item.total * 100) : 0 }))
+  const recentProblems = [...attemptedIds].map((id) => catalog.find((problem) => problem.id === id)).filter(Boolean).slice(-8).reverse()
+  const weeklyActivity = Array.from({ length: 7 }, (_, index) => {
+    const date = new Date(now - (6 - index) * 24 * 60 * 60 * 1000)
+    const key = date.toISOString().slice(0, 10)
+    return { date: key, submissions: weekSubmissions.filter((item) => String(item.createdAt || '').slice(0, 10) === key).length }
+  })
+  let streak = 0
+  for (let offset = 0; offset < 365; offset += 1) {
+    const key = new Date(now - offset * 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
+    if (!submissions.some((item) => String(item.createdAt || '').slice(0, 10) === key)) break
+    streak += 1
+  }
+  return {
+    totalProblems: catalog.length,
+    solvedProblems: [...acceptedIds].filter((id) => catalog.some((problem) => problem.id === id)).length,
+    attemptedProblems: [...attemptedIds].filter((id) => catalog.some((problem) => problem.id === id)).length,
+    totalSubmissions: submissions.length,
+    weekSubmissions: weekSubmissions.length,
+    weekAccepted: weekSubmissions.filter((item) => item.verdict === 'AC').length,
+    passRate: submissions.length ? Math.round(submissions.filter((item) => item.verdict === 'AC').length / submissions.length * 1000) / 10 : 0,
+    streak,
+    recentProblems,
+    seriesProgress,
+    weeklyActivity,
+  }
+}
+
+async function decorateCodeforcesContests(contests) {
+  const submissions = await readSubmissions()
+  const verdicts = latestVerdictsFor(submissions)
+  return contests.map((contest) => {
+    const problems = (contest.problems || []).map((problem) => {
+      const id = `CF-${contest.id}-${problem.index}`
+      const testPack = getCodeforcesTestPackStatus(id)
+      return { ...problem, id, localJudgeReady: testPack.ready, testPointCount: testPack.count, largeTestPointCount: testPack.largeCount, testPack }
+    })
+    const passedCount = problems.reduce((count, problem) => count + (verdicts[`CF-${contest.id}-${problem.index}`] === 'AC' ? 1 : 0), 0)
+    return { ...contest, problems, passedCount, totalProblemCount: problems.length }
+  })
+}
+
+async function readEditorials() {
+  try {
+    const value = JSON.parse(await readFile(editorialsPath, 'utf8'))
+    return value && typeof value === 'object' ? value : {}
+  } catch {
+    return {}
+  }
+}
+
+async function writeEditorials(editorials) {
+  await mkdir(dataDir, { recursive: true })
+  const tempPath = `${editorialsPath}.${process.pid}.${Date.now()}.tmp`
+  await writeFile(tempPath, JSON.stringify(editorials, null, 2), 'utf8')
+  await rename(tempPath, editorialsPath)
+}
+
+function fallbackEditorial(problem) {
+  const modelName = problem.coreModel || problem.tags?.join('、') || '题意建模与直接求解'
+  const statement = problem.statement || {}
+  const process = [
+    `先按题意读取输入，明确需要维护的状态、边界条件以及最终输出。`,
+    statement.hint || `将问题建模为“${modelName}”，只保留影响答案的必要信息。`,
+    `按照题目给出的操作顺序更新状态；每一步都保持模型中的不变量，最后输出题目要求的唯一结果。`,
+  ]
+  return {
+    title: `做法一：${modelName}`,
+    idea: statement.solutionOutline || statement.hint || `本题的核心是把题意转换为${modelName}模型。先处理最小规模、重复值和极端值，再执行主流程。`,
+    process,
+    complexity: statement.targetComplexity || '时间复杂度和空间复杂度取决于题目约束与所选数据结构。',
+    code: problem.referenceSolution || '',
+  }
+}
+
+function codeforces2248AEditorial(problem) {
+  return {
+    title: '做法一：分别找到双方最优删除位置',
+    idea: 'Alice 删除一个 0，希望剩余串字典序尽可能大，因此应删除最靠前的 0；越早消除 0，越可能让后面的 1 提前。Alice 操作后，Bob 删除一个 1，希望结果尽可能小，因此应删除当前串最靠前的 1。两次选择相互独立地服从字典序的首个不同位置原则。',
+    process: [
+      '从左向右找到原串中第一个字符 0，删除它。题目保证至少存在一个 0。',
+      '在删除后的字符串中再次从左向右扫描，找到第一个字符 1 并删除。题目保证至少存在一个 1，且 Alice 删除的是 0，所以 1 仍然存在。',
+      '输出剩余字符串。每个测试用例只需要两次线性扫描。',
+    ],
+    complexity: '设字符串长度为 n。时间复杂度 O(n)，额外空间复杂度 O(n)（使用 string::erase 保存结果；若原地构造答案也可做到 O(1) 额外工作空间）。',
+    code: String.raw`#include <bits/stdc++.h>
+using namespace std;
+
+int main() {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
+    int t;
+    cin >> t;
+    while (t--) {
+        string s;
+        cin >> s;
+        s.erase(s.find('0'), 1);
+        s.erase(s.find('1'), 1);
+        cout << s << '\n';
+    }
+    return 0;
+}`,
+  }
+}
+
+function localEditorials(problem) {
+  if (problem.id === 'CF-2248-A') return [codeforces2248AEditorial(problem)]
+  return [fallbackEditorial(problem)]
+}
+
+async function generateEditorials(problem) {
+  if (problem.id === 'CF-2248-A') return localEditorials(problem)
+  if (!apiKey) return localEditorials(problem)
+  const payload = {
+    id: problem.id,
+    title: problem.title || problem.name,
+    tags: problem.tags || [],
+    statement: problem.statement,
+    referenceSolution: problem.referenceSolution || '',
+  }
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), 35_000)
+  let upstream
+  try {
+    upstream = await fetch(`${apiBaseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+      signal: controller.signal,
+      body: JSON.stringify({
+        model,
+        temperature: 0.1,
+        max_tokens: 6000,
+        messages: [
+          { role: 'system', content: '你是算法竞赛题解作者。根据题目与参考代码输出简体中文 JSON：{"editorials":[{"title":"差异明显的做法名称","idea":"算法思想详细说明","process":["步骤1","步骤2"],"complexity":"时间与空间复杂度","code":"完整 C++17 代码"}]}。只有算法本质明显不同才拆成多种做法；不要伪造不可验证的做法；必须返回可解析 JSON。' },
+          { role: 'user', content: JSON.stringify(payload) },
+        ],
+      }),
+    })
+  } finally {
+    clearTimeout(timer)
+  }
+  if (!upstream.ok) throw new Error(`题解生成服务返回 HTTP ${upstream.status}`)
+  const data = await upstream.json()
+  const content = data.choices?.[0]?.message?.content || ''
+  const parsed = JSON.parse(content.replace(/^```json\s*|\s*```$/g, ''))
+  if (!Array.isArray(parsed.editorials) || !parsed.editorials.length) throw new Error('题解生成结果为空')
+  return parsed.editorials.filter((item) => item?.idea && item?.complexity).map((item, index) => ({
+    title: item.title || `做法 ${index + 1}`,
+    idea: String(item.idea),
+    process: Array.isArray(item.process) ? item.process.map(String) : [String(item.process || '')].filter(Boolean),
+    complexity: String(item.complexity),
+    code: String(item.code || problem.referenceSolution || ''),
+  }))
+}
+
+async function handleProblemEditorial(requestUrl, response, problemId) {
+  const problem = await findAnyProblem(problemId)
+  if (!problem) { sendJson(response, 404, { error: { message: '题目不存在。' } }); return }
+  const force = requestUrl.searchParams.get('force') === '1'
+  const cache = await readEditorials()
+  if (!force && Array.isArray(cache[problem.id]?.editorials)) {
+    sendJson(response, 200, { editorials: cache[problem.id].editorials, cached: true })
+    return
+  }
+  let editorials
+  try {
+    editorials = await generateEditorials(problem)
+  } catch (error) {
+    console.warn(`[editorial] fallback for ${problem.id}: ${error.message}`)
+    editorials = localEditorials(problem)
+  }
+  cache[problem.id] = { generatedAt: Date.now(), editorials }
+  await writeEditorials(cache)
+  sendJson(response, 200, { editorials, cached: false })
 }
 
 async function getJudgeHealth() {
@@ -635,20 +1114,29 @@ async function handleRun(request, response) {
     return
   }
 
-  const problem = problems.find((item) => item.id === body.problemId)
+  const problem = await findAnyProblem(body.problemId)
   if (!problem) {
     sendJson(response, 404, { error: { message: '题目不存在。' } })
     return
   }
 
-  const tests = body.customInput !== undefined
-    ? []
+  const tests = body.customInput !== undefined ? [] : getAnyProblemTests(problem)
+  if (body.customInput === undefined && String(problem.id || '').startsWith('CF-')) {
+    const testPack = getCodeforcesTestPackStatus(problem.id)
+    if (!testPack.ready) {
+      sendJson(response, 503, { error: { message: `Codeforces 本地评测数据未通过门禁：${testPack.issues.join('；')}` } })
+      return
+    }
+  }
+  /*
     : problem.samples.map((sample, index) => ({ name: `样例 ${index + 1}`, score: 100 / problem.samples.length, ...sample }))
+  */
   const result = await judgeCode({
     problem,
     code: String(body.code || ''),
     tests,
     customInput: body.customInput !== undefined ? String(body.customInput) : null,
+    expectedOutput: body.expectedOutput !== undefined ? String(body.expectedOutput) : null,
   })
   sendJson(response, 200, result)
 }
@@ -662,13 +1150,20 @@ async function handleSubmit(request, response) {
     return
   }
 
-  const problem = problems.find((item) => item.id === body.problemId)
+  const problem = await findAnyProblem(body.problemId)
   if (!problem) {
     sendJson(response, 404, { error: { message: '题目不存在。' } })
     return
   }
 
-  const tests = getProblemTests(problem.id)
+  const tests = getAnyProblemTests(problem)
+  if (String(problem.id || '').startsWith('CF-')) {
+    const testPack = getCodeforcesTestPackStatus(problem.id)
+    if (!testPack.ready) {
+      sendJson(response, 503, { error: { message: `Codeforces 本地评测数据未通过门禁：${testPack.issues.join('；')}` } })
+      return
+    }
+  }
   if (!tests.length) {
     sendJson(response, 503, { error: { message: '该题暂未配置评测数据。' } })
     return
@@ -693,11 +1188,12 @@ async function handleSubmit(request, response) {
     cases: result.cases || [],
     createdAt: new Date().toISOString(),
     durationMs: Date.now() - startedAt,
+    code: String(body.code || ''),
   }
 
   const submissions = await readSubmissions()
   submissions.push(submission)
-  await writeSubmissions(submissions.slice(-500))
+  await writeSubmissions(retainRecentSubmissions(submissions))
   sendJson(response, 200, { ...result, submission })
 }
 
@@ -709,7 +1205,7 @@ async function handleListSubmissions(requestUrl, response) {
     submissions: filtered
       .slice()
       .reverse()
-      .slice(0, 80),
+      .slice(0, 15),
   })
 }
 
@@ -736,8 +1232,67 @@ async function route(request, response) {
     return
   }
 
+  if (request.method === 'GET' && requestUrl.pathname === '/api/overview') {
+    sendJson(response, 200, await buildOverview())
+    return
+  }
+
+  if (request.method === 'GET' && requestUrl.pathname === '/api/search') {
+    sendJson(response, 200, await resolveSearch(requestUrl.searchParams.get('q') || ''))
+    return
+  }
+
+  if (request.method === 'POST' && requestUrl.pathname === '/api/codeforces/translate') {
+    await handleCodeforcesTranslate(request, response)
+    return
+  }
+
   if (request.method === 'GET' && requestUrl.pathname === '/api/judge/health') {
     sendJson(response, 200, await getJudgeHealth())
+    return
+  }
+
+  if (request.method === 'GET' && requestUrl.pathname === '/api/codeforces/status') {
+    sendJson(response, 200, getCodeforcesStatus())
+    return
+  }
+
+  if (request.method === 'GET' && requestUrl.pathname === '/api/codeforces/contests') {
+    sendJson(response, 200, { contests: await decorateCodeforcesContests(await listCodeforcesContests()) })
+    return
+  }
+
+  if (request.method === 'POST' && requestUrl.pathname === '/api/codeforces/sync') {
+    let body = {}
+    try { body = await readJson(request) } catch { /* defaults are safe */ }
+    const data = await syncCodeforcesContests({ days: Number(body.days) || 30, force: true })
+    void pretranslateCodeforcesStatements({ days: 30, translate: translateCodeforcesProblem }).then(() => scheduleCodeforcesTestPackGeneration())
+    sendJson(response, 200, { ...data, contests: await decorateCodeforcesContests(await listCodeforcesContests()) })
+    return
+  }
+
+  if (request.method === 'POST' && requestUrl.pathname === '/api/codeforces/generate-tests') {
+    const started = scheduleCodeforcesTestPackGeneration()
+    sendJson(response, 202, { started, status: getCodeforcesStatus() })
+    return
+  }
+
+  const cfContestMatch = requestUrl.pathname.match(/^\/api\/codeforces\/contests\/(\d+)$/)
+  if (request.method === 'GET' && cfContestMatch) {
+    const contest = await getCodeforcesContest(cfContestMatch[1])
+    if (!contest) { sendJson(response, 404, { error: { message: 'Contest not found' } }); return }
+    const submissions = await readSubmissions()
+    const problemIds = (contest.problems || []).map((problem) => `CF-${contest.id}-${problem.index}`)
+    const decoratedContest = (await decorateCodeforcesContests([contest]))[0]
+    sendJson(response, 200, { contest: decoratedContest, verdicts: latestVerdictsFor(submissions, problemIds) })
+    return
+  }
+
+  const cfProblemMatch = requestUrl.pathname.match(/^\/api\/codeforces\/problems\/(\d+)\/([^/]+)$/)
+  if (request.method === 'GET' && cfProblemMatch) {
+    const problem = await getCodeforcesProblem(cfProblemMatch[1], decodeURIComponent(cfProblemMatch[2]))
+    if (!problem) { sendJson(response, 404, { error: { message: 'Codeforces problem not found' } }); return }
+    sendJson(response, 200, { problem: publicProblem(problem) })
     return
   }
 
@@ -748,12 +1303,18 @@ async function route(request, response) {
 
   const problemMatch = requestUrl.pathname.match(/^\/api\/problems\/([^/]+)$/)
   if (request.method === 'GET' && problemMatch) {
-    const problem = problems.find((item) => item.id === decodeURIComponent(problemMatch[1]))
+    const problem = await findAnyProblem(decodeURIComponent(problemMatch[1]))
     if (!problem) {
       sendJson(response, 404, { error: { message: '题目不存在。' } })
       return
     }
     sendJson(response, 200, { problem: publicProblem(problem) })
+    return
+  }
+
+  const editorialMatch = requestUrl.pathname.match(/^\/api\/problems\/([^/]+)\/editorials$/)
+  if (request.method === 'GET' && editorialMatch) {
+    await handleProblemEditorial(requestUrl, response, decodeURIComponent(editorialMatch[1]))
     return
   }
 
@@ -791,6 +1352,19 @@ const server = createServer((request, response) => {
   route(request, response).catch((error) => {
     sendJson(response, 500, { error: { message: error.message || '服务端内部错误。' } })
   })
+})
+
+// Keep the Codeforces archive warm in the background. The request path still
+// performs a TTL check, so this timer is only a convenience for running the
+// daily sync even when nobody opens the archive page that day.
+const codeforcesDailySync = setInterval(() => {
+  syncCodeforcesContests({ days: 30, force: true }).then(() => pretranslateCodeforcesStatements({ days: 30, translate: translateCodeforcesProblem })).then(() => scheduleCodeforcesTestPackGeneration()).catch((error) => {
+    console.warn(`[codeforces] daily sync skipped: ${error.message}`)
+  })
+}, 24 * 60 * 60 * 1000)
+codeforcesDailySync.unref?.()
+syncCodeforcesContests({ days: 30 }).then(() => pretranslateCodeforcesStatements({ days: 30, translate: translateCodeforcesProblem })).then(() => scheduleCodeforcesTestPackGeneration()).catch((error) => {
+  console.warn(`[codeforces] initial sync/translation skipped: ${error.message}`)
 })
 
 server.listen(port, host, () => {

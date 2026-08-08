@@ -9,11 +9,14 @@ import {
   LayoutDashboard,
   Settings,
   Trophy,
+  Globe2,
 } from 'lucide-react'
 
 const mainNav = [
   { to: '/', label: '学习概览', icon: LayoutDashboard, end: true },
   { to: '/problems', label: 'Online Judge', icon: Code2 },
+  { to: '/codeforces', label: 'Codeforces Contests', icon: Globe2 },
+  { to: '/contests/acm-regional-2026', label: 'ACM 模拟竞赛', icon: Trophy },
   { to: '/courses', label: '精品课程', icon: GraduationCap },
   { to: '/ai', label: '算法 AI', icon: Bot, badge: 'AI' },
 ]
